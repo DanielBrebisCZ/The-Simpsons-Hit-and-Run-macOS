@@ -1,0 +1,73 @@
+# Android project & legacy docs (not tracked for macOS repo)
+android-project/
+gradlew
+gradlew.bat
+TOUCH_CONTROLS.md
+INSTALLATION.md
+CHANGELOG.md
+FEATURES.md
+FUTURE_WORK.md
+CONTROLLER_CONTROLS.md
+
+.gradle/
+**/.gradle/
+
+build/
+**/build/
+
+.cxx/
+**/.cxx/
+
+.externalNativeBuild/
+**/.externalNativeBuild/
+
+# Native/CMake/Ninja generated files
+**/CMakeFiles/
+**/.ninja_deps
+**/.ninja_log
+**/build.ninja
+**/cmake_install.cmake
+**/CMakeCache.txt
+
+# Local Android config
+local.properties
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# APKs and release files
+APKs/
+*.apk
+*.aab
+
+# Signing keys
+*.jks
+*.keystore
+*.pem
+*.p12
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Game assets & saves (DO NOT COMMIT)
+*.rcf
+*.p3d
+Save*
+save*
+simpsons.ini
+
+# macOS release artifacts
+*.dmg
+*.app/
+*.zip
+*.tar.gz
+rw.*

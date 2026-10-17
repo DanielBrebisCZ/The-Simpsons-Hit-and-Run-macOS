@@ -1,0 +1,1050 @@
+//=============================================================================
+// Copyright (c) 2002 Radical Games Ltd.  All rights reserved.
+//=============================================================================
+
+
+//=============================================================================
+//
+// File:        movieplayer.cpp
+//
+// Subsystem:	Foundation Technologies - Movie
+//
+// Description:	This file contains the implementation of the Foundation 
+//              Technologies movie player
+//
+// Date:    	May 16, 2002
+//
+//=============================================================================
+
+//=============================================================================
+// Include Files
+//=============================================================================
+
+#include <radoptions.hpp>
+#ifdef RAD_ANDROID
+    #include <string>
+    #include <errno.h>
+    #include <cstdio>
+#endif
+#ifndef RAD_MOVIEPLAYER_USE_BINK
+
+#include <raddebug.hpp>
+#include <radmath/radmath.hpp>
+#include "radmoviefile.hpp"
+#include "ffmpegmovieplayer.hpp"
+#include "audiodatasource.hpp"
+
+#include <vector>
+
+
+#if defined(RAD_ANDROID)
+  #include <android/log.h>
+  #define LOG_TAG "SimpsonsHitAndRun"
+  #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+  #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+#elif defined(RAD_VITA)
+  #include <psp2/kernel/clib.h>
+  #define LOGI(...) do { sceClibPrintf(__VA_ARGS__); sceClibPrintf("\n"); } while(0)
+  #define LOGE(...) do { sceClibPrintf(__VA_ARGS__); sceClibPrintf("\n"); } while(0)
+
+#else
+  #include <cstdio>
+  #define LOGI(...) do { std::printf(__VA_ARGS__); std::printf("\n"); std::fflush(stdout); } while(0)
+  #define LOGE(...) do { std::printf(__VA_ARGS__); std::printf("\n"); std::fflush(stdout); } while(0)
+#endif
+
+extern "C"
+{
+    #include <libavcodec/avcodec.h>
+    #include <libavformat/avformat.h>
+    #include <libswscale/swscale.h>
+    #include <libswresample/swresample.h>
+}
+
+//=============================================================================
+// Constants
+//=============================================================================
+
+const char * radMovieDebugChannel2 = "radMovie";
+unsigned int const radMovie_NoAudioTrack = 0xFFFFFFFF;
+
+//=============================================================================
+// Local Definitions
+//=============================================================================
+
+//
+// If the video of the movie player starts falling behind the audio,
+// the movie player will not render frames until it catches up.  This
+// value controls how many milliseconds the video can fall behind before
+// the catch-up process begins
+//
+
+#define RAD_MOVIE_PLAYER_VIDEO_LAG 10
+
+// DESPUÉS (bien)
+#define AV_CHK(x) do { \
+    int error = (x); \
+    if (error < 0) { \
+        char str[AV_ERROR_MAX_STRING_SIZE]; \
+        av_strerror(error, str, AV_ERROR_MAX_STRING_SIZE); \
+        rDebugPrintf("FFMPEG error=%d (%s) at %s:%d\n", error, str, __FILE__, __LINE__); \
+        SetState(IRadMoviePlayer2::NoData); \
+        return; \
+    } \
+} while(0)
+
+//=============================================================================
+// Static Members
+//=============================================================================
+
+template<> radMoviePlayer* radLinkedClass< radMoviePlayer >::s_pLinkedClassHead = NULL;
+template<> radMoviePlayer* radLinkedClass< radMoviePlayer >::s_pLinkedClassTail = NULL;
+
+//=============================================================================
+// Public Member Functions
+//=============================================================================
+
+//=============================================================================
+// radMoviePlayer::radMoviePlayer
+//=============================================================================
+
+radMoviePlayer::radMoviePlayer( void )
+    :
+    radRefCount( 0 ),
+    m_refIRadMovieRenderStrategy( NULL ),
+    m_refIRadMovieRenderLoop( NULL ),
+    m_refIRadStopwatch( NULL ),
+    m_State( IRadMoviePlayer2::NoData ),
+    m_VideoFrameState( VideoFrame_Unlocked ),
+    m_VideoTrackIndex( 0 ),
+    m_AudioTrackIndex( -1 ),
+    m_PresentationTime( 0 ),
+    m_PresentationDuration( 0 ),
+    m_pFormatCtx( NULL ),
+    m_pVideoCtx( NULL ),
+    m_pAudioCtx( NULL ),
+    m_pSwsCtx( NULL ),
+    m_pSwrCtx( NULL ),
+    m_pPacket( NULL ),
+    m_pVideoFrame( NULL ),
+    m_pAudioFrame( NULL ),
+    m_AudioSource( 0 ),
+	
+	// --- ANDROID timing fixes ---
+    m_HasPtsBase( false ),
+    m_PtsBase( 0 ),
+    m_DefaultFrameDurationMs( 33 ),   // ~30fps fallback
+    m_ClockSynced(false),
+    m_ClockOffsetMs(0),
+    m_RenderedFirstEarly(false)
+{
+    radTimeCreateStopwatch( &m_refIRadStopwatch, radTimeUnit_Millisecond, GetThisAllocator( ) );
+}
+
+//=============================================================================
+// radMoviePlayer::~radMoviePlayer
+//=============================================================================
+
+radMoviePlayer::~radMoviePlayer( void )
+{
+}
+
+//=============================================================================
+// radMoviePlayer::Initialize
+//=============================================================================
+
+void radMoviePlayer::Initialize
+( 
+    IRadMovieRenderLoop * pIRadMovieRenderLoop, 
+    IRadMovieRenderStrategy * pIRadMovieRenderStrategy
+)
+{
+    rAssert( pIRadMovieRenderStrategy != NULL );
+
+    // Hang on to the loop and strategy
+
+    m_refIRadMovieRenderLoop = pIRadMovieRenderLoop;
+    m_refIRadMovieRenderStrategy = pIRadMovieRenderStrategy;
+
+    //
+    // Update the state
+    //
+
+    SetState( IRadMoviePlayer2::NoData );
+}
+
+//=============================================================================
+// radMoviePlayer::Render
+//=============================================================================
+
+bool radMoviePlayer::Render( void )
+{
+    rAssert( m_refIRadMovieRenderStrategy != NULL );
+    rAssert( m_pVideoFrame != NULL );
+
+    if( m_refIRadMovieRenderStrategy == NULL )
+    {
+        return false;
+    }
+
+    if( m_pVideoFrame == NULL )
+    {
+        m_VideoFrameState = VideoFrame_Unlocked;
+        return false;
+    }
+
+    bool ret = m_refIRadMovieRenderStrategy->Render( );
+
+    if( m_AudioSource != 0 && m_AudioTrackIndex >= 0 )
+    {
+        ALint state;
+        alGetSourcei( m_AudioSource, AL_SOURCE_STATE, &state );
+        if( state != AL_PLAYING )  // have we fallen behind, if so reset
+        {
+            alSourcePlay( m_AudioSource );
+        }
+
+        FlushAudioQueue();
+    }
+
+    //
+    // The video frame has been used.  The next can be decoded
+    //
+
+    m_VideoFrameState = VideoFrame_Unlocked;
+
+    return ret;
+}
+
+// Version que ya he comprobado que funciona en in-game y tambien en el menu 
+/*
+#ifdef RAD_ANDROID
+#include <SDL_system.h>
+#include <string>
+
+static std::string RadMakeAbsoluteGamePath(const char* path)
+{
+    if (!path || !path[0]) return {};
+
+    std::string p(path);
+    for (char& c : p) if (c == '\\') c = '/';
+
+    // Si ya es absoluta, devolver tal cual
+    if (p[0] == '/' || (p.size() >= 2 && p[1] == ':') || p.find("://") != std::string::npos)
+        return p;
+
+    const char* ext = SDL_AndroidGetExternalStoragePath();
+
+    // Fallback seguro
+    std::string base = (ext && ext[0]) ? std::string(ext) : std::string("/storage/emulated/0");
+
+    // Normaliza por si ext trae '\'
+    for (char& c : base) if (c == '\\') c = '/';
+
+    // Si ext YA apunta al root de tu app (contiene "/Android/data/<pkg>/files")
+    // entonces NO volvemos a añadirlo.
+    if (base.find("/Android/data/") == std::string::npos)
+    {
+        base += "/Android/data/org.libsdl.app/files";
+    }
+
+    // Asegurar '/' final
+    if (!base.empty() && base.back() != '/')
+        base.push_back('/');
+
+    return base + p;
+}
+#endif
+*/
+
+
+// Ahora pongo una nueva version que no hardcodea el paquete org.libsdl y se supone que nos ofrecera mismo comportamiento correcto que la funcion de arriba
+#ifdef RAD_ANDROID
+#include <SDL_system.h>
+#include <string>
+
+static std::string RadMakeAbsoluteGamePath(const char* path)
+{
+    if (!path || !path[0]) return {};
+
+    std::string p(path);
+    for (char& c : p) if (c == '\\') c = '/';
+
+    if (p[0] == '/' || (p.size() >= 2 && p[1] == ':') || p.find("://") != std::string::npos)
+        return p;
+
+    const char* ext = SDL_AndroidGetExternalStoragePath();
+
+    std::string base;
+    if (ext && ext[0])
+    {
+        base = ext;
+    }
+    else
+    {
+        base = "/storage/emulated/0";
+    }
+
+    for (char& c : base) if (c == '\\') c = '/';
+
+    // Si SDL solo devuelve "/storage/emulated/0", completamos como haces con el drive “ideal”
+    if (base.find("/Android/data/") == std::string::npos)
+    {
+        // OJO: aquí sí tienes hardcodeado el package (igual que en tu fallback actual)
+        base += "/Android/data/org.libsdl.app/files";
+    }
+
+    if (!base.empty() && base.back() != '/')
+        base.push_back('/');
+
+    return base + p;
+}
+#endif
+
+
+//=============================================================================
+// radMoviePlayer::Load
+//=============================================================================
+/*
+void radMoviePlayer::Load( const char * pVideoFileName, unsigned int audioTrackIndex )
+{   
+    rAssert( m_State == IRadMoviePlayer2::NoData );
+    rAssert( pVideoFileName != NULL );
+
+    rDebugPrintf( "radMoviePlayer: Loading %s\n", pVideoFileName );
+rDebugPrintf("FFMPEG config: %s\n", avcodec_configuration());
+rDebugPrintf("FFMPEG versions: avformat=%u avcodec=%u avutil=%u\n",
+             avformat_version(), avcodec_version(), avutil_version());
+    m_refIRadStopwatch->Stop( );
+    m_refIRadStopwatch->Reset( );
+
+    //
+    // Reset the variables
+    //
+
+    m_VideoFrameState = VideoFrame_Unlocked;
+
+    SetState( IRadMoviePlayer2::Loading );
+
+    m_pFormatCtx = avformat_alloc_context();
+	// --- DEBUG: comprobar que el archivo realmente existe ---
+	FILE* f = fopen(pVideoFileName, "rb");
+	if(!f) {
+    rDebugPrintf("MOVIE fopen FAILED path='%s' errno=%d\n", pVideoFileName, errno);
+    SetState(IRadMoviePlayer2::NoData);
+    return;
+}
+else {
+    rDebugPrintf("MOVIE fopen OK path='%s'\n", pVideoFileName);
+    fclose(f);
+}
+// ---------------------------------------------------------
+    AV_CHK( avformat_open_input( &m_pFormatCtx, pVideoFileName, NULL, NULL ) );
+    AV_CHK( avformat_find_stream_info( m_pFormatCtx, NULL ) );
+
+    const AVCodec* pVideoCodec = NULL;
+    m_VideoTrackIndex = av_find_best_stream( m_pFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &pVideoCodec, 0 );
+    AVCodecParameters* pVideoParams = m_pFormatCtx->streams[m_VideoTrackIndex]->codecpar;
+    m_pVideoCtx = avcodec_alloc_context3( pVideoCodec );
+    AV_CHK( avcodec_parameters_to_context( m_pVideoCtx, pVideoParams ) );
+    AV_CHK( avcodec_open2( m_pVideoCtx, pVideoCodec, NULL ) );
+
+#ifndef RAD_VITAGL
+   m_pSwsCtx = sws_getContext(
+    pVideoParams->width,
+    pVideoParams->height,
+    m_pVideoCtx->pix_fmt,   // usar formato real
+    pVideoParams->width,
+    pVideoParams->height,
+    AV_PIX_FMT_BGRA,
+    SWS_BILINEAR,
+    NULL, NULL, NULL
+);
+#endif
+
+    if( audioTrackIndex != radMovie_NoAudioTrack )
+    {
+        const AVCodec* pAudioCodec = NULL;
+        m_AudioTrackIndex = av_find_best_stream( m_pFormatCtx, AVMEDIA_TYPE_AUDIO, audioTrackIndex + 1, -1, &pAudioCodec, 0 );
+        AVCodecParameters* pAudioParams = m_pFormatCtx->streams[m_AudioTrackIndex]->codecpar;
+        m_pAudioCtx = avcodec_alloc_context3( pAudioCodec );
+        AV_CHK( avcodec_parameters_to_context( m_pAudioCtx, pAudioParams ) );
+        AV_CHK( avcodec_open2( m_pAudioCtx, pAudioCodec, NULL ) );
+
+        AVChannelLayout layout = { AV_CHANNEL_ORDER_NATIVE, 2, AV_CH_LAYOUT_STEREO };
+        AV_CHK( swr_alloc_set_opts2( &m_pSwrCtx,
+            &layout,
+            AV_SAMPLE_FMT_S16,
+            pAudioParams->sample_rate,
+            &pAudioParams->ch_layout,
+            (AVSampleFormat)pAudioParams->format,
+            pAudioParams->sample_rate,
+            0,
+            NULL ) );
+        swr_init( m_pSwrCtx );
+    }
+    else
+    {
+        m_AudioTrackIndex = 0;
+    }
+
+    m_pPacket = av_packet_alloc();
+    m_pVideoFrame = av_frame_alloc();
+    m_pAudioFrame = av_frame_alloc();
+
+    alGenSources( 1, &m_AudioSource );
+    alSourcei( m_AudioSource, AL_SOURCE_RELATIVE, AL_TRUE );
+
+    //
+    // Initialize the render strategy & and pass the file to
+    // the decoder to deal with
+    //
+
+    m_refIRadMovieRenderStrategy->ChangeParameters( pVideoParams->width, pVideoParams->height );
+
+    //
+    // Print out some helpful information
+    //
+    rDebugPrintf( "\nradMoviePlayer: Summary\n" \
+                  "     * Resolution         [%dx%d]\n" \
+                  "     * Format             [%d]\n" \
+                  "     * Audio Track        [%d]\n\n",
+        pVideoParams->width, pVideoParams->height,
+        pVideoParams->format, m_AudioTrackIndex );
+
+    // The buffered data source's input must be set before the stream player's
+
+    SetState( IRadMoviePlayer2::ReadyToPlay );
+
+    Service( );
+}
+*/
+//=============================================================================
+// radMoviePlayer::Unload
+//=============================================================================
+
+
+// NEW LOAD FOR ANDROID 
+void radMoviePlayer::Load( const char * pVideoFileName, unsigned int audioTrackIndex )
+{
+    rAssert( m_State == IRadMoviePlayer2::NoData );
+    rAssert( pVideoFileName != NULL );
+
+#ifdef RAD_ANDROID
+    std::string resolved = RadMakeAbsoluteGamePath( pVideoFileName );
+    const char* moviePath = resolved.c_str();
+#else
+    const char* moviePath = pVideoFileName;
+#endif
+
+    m_refIRadStopwatch->Stop( );
+    m_refIRadStopwatch->Reset( );
+
+    // Reset variables
+    m_VideoFrameState = VideoFrame_Unlocked;
+
+    SetState( IRadMoviePlayer2::Loading );
+
+    m_pFormatCtx = avformat_alloc_context();
+
+    FILE* f = fopen( moviePath, "rb" );
+    if( !f )
+    {
+        SetState( IRadMoviePlayer2::NoData );
+        return;
+    }
+    fclose( f );
+
+    AV_CHK( avformat_open_input( &m_pFormatCtx, moviePath, NULL, NULL ) );
+    AV_CHK( avformat_find_stream_info( m_pFormatCtx, NULL ) );
+
+    const AVCodec* pVideoCodec = NULL;
+    m_VideoTrackIndex = av_find_best_stream( m_pFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &pVideoCodec, 0 );
+    if( m_VideoTrackIndex < 0 || pVideoCodec == NULL )
+    {
+        SetState( IRadMoviePlayer2::NoData );
+        return;
+    }
+    AVCodecParameters* pVideoParams = m_pFormatCtx->streams[m_VideoTrackIndex]->codecpar;
+
+    m_pVideoCtx = avcodec_alloc_context3( pVideoCodec );
+    AV_CHK( avcodec_parameters_to_context( m_pVideoCtx, pVideoParams ) );
+    AV_CHK( avcodec_open2( m_pVideoCtx, pVideoCodec, NULL ) );
+
+    // timing base reset
+    m_HasPtsBase = false;
+    m_PtsBase = 0;
+    m_ClockSynced = false;
+    m_ClockOffsetMs = 0;
+    m_RenderedFirstEarly = false;
+
+    // default duration fallback based on stream FPS
+    m_DefaultFrameDurationMs = 33; // default ~30fps
+    AVRational fr = m_pFormatCtx->streams[m_VideoTrackIndex]->avg_frame_rate;
+    if( fr.num > 0 && fr.den > 0 )
+    {
+        double fps = av_q2d( fr );
+        if( fps > 1.0 && fps < 240.0 )
+        {
+            m_DefaultFrameDurationMs = (unsigned int)( 1000.0 / fps + 0.5 );
+        }
+    }
+
+#ifndef RAD_VITAGL
+    m_pSwsCtx = sws_getContext(
+        pVideoParams->width,
+        pVideoParams->height,
+        m_pVideoCtx->pix_fmt,
+        pVideoParams->width,
+        pVideoParams->height,
+        AV_PIX_FMT_BGRA,
+        SWS_BILINEAR,
+        NULL, NULL, NULL
+    );
+#endif
+
+    m_AudioTrackIndex = -1;
+    m_pAudioCtx = NULL;
+    m_pSwrCtx = NULL;
+
+    if( audioTrackIndex != radMovie_NoAudioTrack )
+    {
+        const AVCodec* pAudioCodec = NULL;
+
+        int audioStream = av_find_best_stream(
+            m_pFormatCtx,
+            AVMEDIA_TYPE_AUDIO,
+            -1,
+            -1,
+            &pAudioCodec,
+            0
+        );
+
+        if( audioStream >= 0 && pAudioCodec != NULL )
+        {
+            m_AudioTrackIndex = audioStream;
+            AVCodecParameters* pAudioParams = m_pFormatCtx->streams[m_AudioTrackIndex]->codecpar;
+
+            m_pAudioCtx = avcodec_alloc_context3( pAudioCodec );
+            if( m_pAudioCtx != NULL )
+            {
+                AV_CHK( avcodec_parameters_to_context( m_pAudioCtx, pAudioParams ) );
+                AV_CHK( avcodec_open2( m_pAudioCtx, pAudioCodec, NULL ) );
+
+                AVChannelLayout layout = { AV_CHANNEL_ORDER_NATIVE, 2, AV_CH_LAYOUT_STEREO };
+                AV_CHK( swr_alloc_set_opts2(
+                    &m_pSwrCtx,
+                    &layout,
+                    AV_SAMPLE_FMT_S16,
+                    pAudioParams->sample_rate,
+                    &pAudioParams->ch_layout,
+                    (AVSampleFormat)pAudioParams->format,
+                    pAudioParams->sample_rate,
+                    0,
+                    NULL
+                ) );
+
+                if( m_pSwrCtx != NULL )
+                {
+                    swr_init( m_pSwrCtx );
+                }
+            }
+        }
+    }
+
+    m_pPacket = av_packet_alloc();
+    m_pVideoFrame = av_frame_alloc();
+    m_pAudioFrame = av_frame_alloc();
+
+    alGenSources( 1, &m_AudioSource );
+    alSourcei( m_AudioSource, AL_SOURCE_RELATIVE, AL_TRUE );
+
+    m_refIRadMovieRenderStrategy->ChangeParameters( pVideoParams->width, pVideoParams->height );
+
+    SetState( IRadMoviePlayer2::ReadyToPlay );
+
+    Service();
+}
+
+void radMoviePlayer::Unload( void )
+{
+    if( m_State != IRadMoviePlayer2::NoData )
+    {
+        if( m_AudioSource != 0 )
+        {
+            alSourceStop( m_AudioSource );
+            FlushAudioQueue();
+            alDeleteSources( 1, &m_AudioSource );
+            m_AudioSource = 0;
+        }
+
+#ifndef RAD_VITAGL
+        if( m_pSwsCtx != NULL )
+        {
+            sws_freeContext( m_pSwsCtx );
+            m_pSwsCtx = NULL;
+        }
+#endif
+        if( m_pSwrCtx != NULL )
+        {
+            swr_free( &m_pSwrCtx );
+            m_pSwrCtx = NULL;
+        }
+        if( m_pPacket != NULL )
+        {
+            av_packet_free( &m_pPacket );
+            m_pPacket = NULL;
+        }
+        if( m_pVideoFrame != NULL )
+        {
+            av_frame_free( &m_pVideoFrame );
+            m_pVideoFrame = NULL;
+        }
+        if( m_pAudioFrame != NULL )
+        {
+            av_frame_free( &m_pAudioFrame );
+            m_pAudioFrame = NULL;
+        }
+        if( m_pVideoCtx != NULL )
+        {
+            avcodec_free_context( &m_pVideoCtx );
+            m_pVideoCtx = NULL;
+        }
+        if( m_pAudioCtx != NULL )
+        {
+            avcodec_free_context( &m_pAudioCtx );
+            m_pAudioCtx = NULL;
+        }
+        if( m_pFormatCtx != NULL )
+        {
+            avformat_close_input( &m_pFormatCtx );
+            m_pFormatCtx = NULL;
+        }
+
+        m_refIRadStopwatch->Stop( );
+        m_refIRadStopwatch->Reset( );
+
+        m_VideoFrameState = VideoFrame_Unlocked;
+
+        SetState( IRadMoviePlayer2::NoData );
+    }
+}
+
+//=============================================================================
+// radMoviePlayer::Play
+//=============================================================================
+
+void radMoviePlayer::Play( void )
+{
+    
+    if( m_State == IRadMoviePlayer2::ReadyToPlay )
+    {
+        SetState( IRadMoviePlayer2::Playing );
+        InternalPlay( );
+    }
+    else if( m_State == IRadMoviePlayer2::Loading )
+    {
+        SetState( IRadMoviePlayer2::LoadToPlay );
+    }
+}
+
+//=============================================================================
+// radMoviePlayer::Pause
+//=============================================================================
+
+void radMoviePlayer::Pause( void )
+{
+    if( m_State == IRadMoviePlayer2::Playing )
+    {
+        m_refIRadStopwatch->Stop( );
+        SetState( IRadMoviePlayer2::ReadyToPlay );
+    }
+    else if( m_State == IRadMoviePlayer2::LoadToPlay )
+    {
+        SetState( Loading );
+    }
+}
+
+//=============================================================================
+// radMoviePlayer::SetPan
+//=============================================================================
+
+void radMoviePlayer::SetPan( float pan )
+{
+    // Not supported
+}
+
+//=============================================================================
+// radMoviePlayer::GetPan
+//=============================================================================
+
+float radMoviePlayer::GetPan( void )
+{
+    return 0.0f;
+}
+
+//=============================================================================
+// radMoviePlayer::SetVolume
+//=============================================================================
+
+void radMoviePlayer::SetVolume( float volume )
+{
+    // Not supported
+}
+
+//=============================================================================
+// radMoviePlayer::GetVolume
+//=============================================================================
+
+float radMoviePlayer::GetVolume( void )
+{
+    return 1.0f;
+}
+
+//=============================================================================
+// radMoviePlayer::GetState
+//=============================================================================
+
+IRadMoviePlayer2::State radMoviePlayer::GetState( void )
+{
+    return m_State;
+}
+
+//=============================================================================
+// radMoviePlayer::GetVideoFrameInfo
+//=============================================================================
+
+bool radMoviePlayer::GetVideoFrameInfo( VideoFrameInfo * frameInfo)
+{
+    rAssert( frameInfo != NULL );
+
+    if( m_State == IRadMoviePlayer2::Playing ||
+        m_State == IRadMoviePlayer2::ReadyToPlay )
+    {
+
+        // NEW LINES FOR ANDROID
+        if( m_pVideoFrame == NULL )
+        {
+            return false;
+        }
+        // END NEW LINES FOR ANDROID
+
+
+        ( * frameInfo ).Width = m_pVideoFrame->width;
+        ( * frameInfo ).Height = m_pVideoFrame->height;
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+//=============================================================================
+// radMoviePlayer::GetFrameRate
+//=============================================================================
+
+float radMoviePlayer::GetFrameRate( void )
+{
+    // Sweet little lies, frame number is in milliseconds
+    return 1000.0f;
+}
+
+//=============================================================================
+// radMoviePlayer::GetCurrentFrameNumber
+//=============================================================================
+
+unsigned int radMoviePlayer::GetCurrentFrameNumber( void )
+{
+    return m_PresentationTime;
+}
+
+//=============================================================================
+// radMoviePlayer::Service
+//=============================================================================
+
+void radMoviePlayer::Service( void ) {
+    //
+    // Start off by letting the decoder figure out where it is
+    //
+
+    //
+    // Now figure out where we are.
+    //
+
+
+
+    if (m_State == IRadMoviePlayer2::NoData) {
+        // Nothing to do
+    } else if (m_State == IRadMoviePlayer2::Playing) {
+        //
+        // If the video frame is unlocked, we can issue the next decode request.
+        //
+
+        if (m_VideoFrameState == VideoFrame_Unlocked) {
+            //
+            // Keep an eye on the states of things to detect the end of the movie
+            //
+
+            if (av_read_frame(m_pFormatCtx, m_pPacket) >= 0) {
+                if (m_pPacket->stream_index == m_VideoTrackIndex) {
+                    AV_CHK(avcodec_send_packet(m_pVideoCtx, m_pPacket));
+
+                    //
+                    // Decompress all pending video frames
+                    //
+
+                    while (avcodec_receive_frame(m_pVideoCtx, m_pVideoFrame) >= 0) {
+                        // Reset the list of render destinations
+
+                        m_refIRadMovieRenderStrategy->ResetDestinations();
+
+                        // Now go through the list destinations until we've filled 
+                        // them all up with the freshly decoded data
+
+                        IRadMovieRenderStrategy::LockedDestination dest;
+
+                        while (m_refIRadMovieRenderStrategy->LockNextDestination(&dest) > 0) {
+                            uint8_t *pDest = (uint8_t *) dest.m_pDest;
+
+#ifdef RAD_VITAGL
+                            memcpy( pDest, m_pVideoFrame->data[0], m_pVideoFrame->linesize[0] * m_pVideoFrame->height );
+                            pDest += m_pVideoFrame->linesize[0] * m_pVideoFrame->height;
+                            memcpy( pDest, m_pVideoFrame->data[1], m_pVideoFrame->linesize[1] * m_pVideoFrame->height / 2 );
+                            pDest += m_pVideoFrame->linesize[1] * m_pVideoFrame->height / 2;
+                            memcpy( pDest, m_pVideoFrame->data[2], m_pVideoFrame->linesize[2] * m_pVideoFrame->height / 2 );
+#else
+
+                            // If one of these copies fail, we'll have to skip this frame
+                            // and not iterate the loop
+                            if (sws_scale(m_pSwsCtx,
+                                          m_pVideoFrame->data, m_pVideoFrame->linesize,
+                                          dest.m_SrcPosY, m_pVideoFrame->height - dest.m_SrcPosY,
+                                          &pDest, &dest.m_DestPitch) >= 0)
+#endif
+                            {
+                                AVRational tb = m_pFormatCtx->streams[m_VideoTrackIndex]->time_base;
+
+// elegir PTS robusto
+                                int64_t pts = (m_pVideoFrame->best_effort_timestamp !=
+                                               AV_NOPTS_VALUE)
+                                              ? m_pVideoFrame->best_effort_timestamp
+                                              : m_pVideoFrame->pts;
+
+// fijar base del primer PTS para que el tiempo empiece en 0
+                                if (!m_HasPtsBase && pts != AV_NOPTS_VALUE) {
+                                    m_PtsBase = pts;
+                                    m_HasPtsBase = true;
+                                }
+
+                                int64_t relPts = (m_HasPtsBase && pts != AV_NOPTS_VALUE) ? (pts -
+                                                                                            m_PtsBase)
+                                                                                         : 0;
+
+// presentation time en ms relativo
+                                m_PresentationTime = (unsigned int) av_rescale_q(relPts, tb,
+                                                                                 AVRational{1,
+                                                                                            1000});
+
+// duration en ms (con fallback si FFmpeg da 0)
+                                unsigned int durMs = 0;
+                                int64_t dur = m_pVideoFrame->duration;
+
+                                if (dur > 0) {
+                                    durMs = (unsigned int) av_rescale_q(dur, tb,
+                                                                        AVRational{1, 1000});
+                                }
+
+                                if (durMs == 0) {
+                                    durMs = m_DefaultFrameDurationMs;
+                                }
+
+                                m_PresentationDuration = durMs;
+
+
+                                m_VideoFrameState = VideoFrame_Locked;
+                            }
+
+                            m_refIRadMovieRenderStrategy->UnlockDestination();
+                        }
+                    }
+                } else if (m_AudioTrackIndex >= 0 && m_pAudioCtx != NULL && m_pPacket->stream_index == m_AudioTrackIndex) {
+                    AV_CHK(avcodec_send_packet(m_pAudioCtx, m_pPacket));
+
+                    //
+                    // Decompress all pending audio frames
+                    //
+
+                    while (avcodec_receive_frame(m_pAudioCtx, m_pAudioFrame) >= 0) {
+                        uint8_t *output;
+                        int outSamples = swr_get_out_samples(m_pSwrCtx, m_pAudioFrame->nb_samples);
+                        av_samples_alloc(&output, NULL, 2, outSamples,
+                                         AV_SAMPLE_FMT_S16, 0);
+                        outSamples = swr_convert(m_pSwrCtx, &output, outSamples,
+                                                 (const uint8_t **) m_pAudioFrame->data,
+                                                 m_pAudioFrame->nb_samples);
+                        int bufferSize = av_samples_get_buffer_size(NULL, 2,
+                                                                    outSamples, AV_SAMPLE_FMT_S16,
+                                                                    0);
+
+                        // TODO: Add buffer queuing support to radsound and move this code to that module.
+                        ALuint buffer;
+                        alGenBuffers(1, &buffer);
+                        alBufferData(buffer, AL_FORMAT_STEREO16, output, bufferSize,
+                                     m_pAudioFrame->sample_rate);
+                        alSourceQueueBuffers(m_AudioSource, 1, &buffer);
+                        av_freep(&output);
+                    }
+                }
+
+                av_packet_unref(m_pPacket);
+            } else {
+                rDebugChannelPrintf(radMovieDebugChannel2,
+                                    "radMoviePlayer: Out of data at [%lld]\n", m_pVideoFrame->pts);
+
+                // We've hit the end of the movie.  Unload!
+
+                Unload();
+                return;
+            }
+        }
+
+        if (m_VideoFrameState == VideoFrame_Locked) {
+            //
+            // We will render the frame at the appropriate time.  We know that the 
+            // image will be presented on a vsync.  As long as the time between now
+            // and the presentation time is less than a vsync period, we can begin
+            // rendering
+            //
+
+            if (m_refIRadMovieRenderLoop != NULL) {
+                // If the client gave us a render loop, initiate a render of the new frame.
+                // It's okay for us to fall a little behind the presentation time.  We might
+                // catch up without dropping frames.  If we do fall far enough behind, throw
+                // away frames until we're all the way caught up
+
+                // Tiempo actual del stopwatch
+                // Tiempo actual del stopwatch (alineado con PTS)
+                unsigned int sw = m_refIRadStopwatch->GetElapsedTime();
+
+                if (!m_ClockSynced && m_HasPtsBase) {
+                    // Alinea el reloj al PTS actual (más robusto que asumir 0)
+                    m_ClockOffsetMs = sw - m_PresentationTime;
+                    m_ClockSynced = true;
+                }
+
+                unsigned int currentTime = m_ClockSynced ? (sw - m_ClockOffsetMs) : sw;
+// Ventana válida de render
+                unsigned int startTime = m_PresentationTime;
+                unsigned int endTime =
+                        m_PresentationTime + m_PresentationDuration + RAD_MOVIE_PLAYER_VIDEO_LAG;
+
+// --- CASO NORMAL: estamos dentro de la ventana ---
+                if (currentTime >= startTime && currentTime <= endTime) {
+                    m_refIRadMovieRenderLoop->IterateLoop(this);
+                }
+// --- CASO ATRASADO: nos hemos pasado ---
+                else if (currentTime > endTime) {
+                    // Solo desbloqueamos el frame, pero NO paramos audio (esto estaba causando estados raros)
+                    m_VideoFrameState = VideoFrame_Unlocked;
+                }
+// --- CASO ADELANTADO (muy importante para Android) ---
+                else {
+                    // ADELANTADO: aún no toca presentar este frame.
+                    // Para evitar negro inicial, renderiza SOLO la primera vez (primer frame),
+                    // luego espera a su tiempo normal.
+                    if (!m_RenderedFirstEarly) {
+                        m_RenderedFirstEarly = true;
+                        m_refIRadMovieRenderLoop->IterateLoop(this);
+                    }
+                    // Si ya renderizamos el primero, no hacemos nada: esperamos a startTime.
+                }
+            }
+        }
+    }
+}
+
+
+//=============================================================================
+// radMoviePlayer::SetState
+//=============================================================================
+
+void radMoviePlayer::SetState( IRadMoviePlayer2::State state )
+{
+    if( state != m_State )
+    {
+        rDebugChannelPrintf( radMovieDebugChannel2, "radMoviePlayer::SetState [%d]\n", state );
+        m_State = state;
+    }
+}
+
+//=============================================================================
+// radMoviePlayer::InternalPlay
+//=============================================================================
+
+void radMoviePlayer::InternalPlay( void )
+{
+    m_refIRadStopwatch->Start( );
+    Service( );
+}
+
+//=============================================================================
+// radMoviePlayer::FlushAudioQueue
+//=============================================================================
+
+void radMoviePlayer::FlushAudioQueue( void )
+{
+    // Flush the queue, deleting processed buffers
+    ALint processed = 0;
+    alGetSourcei( m_AudioSource, AL_BUFFERS_PROCESSED, &processed );
+    if( processed > 0 )
+    {
+        std::vector<ALuint> buffers( processed );
+        alSourceUnqueueBuffers( m_AudioSource, processed, buffers.data() );
+        alDeleteBuffers( processed, buffers.data() );
+    }
+}
+
+//=============================================================================
+// Function:    radMoviePlayerCreate2
+//=============================================================================
+
+IRadMoviePlayer2 * radMoviePlayerCreate2( radMemoryAllocator alloc )
+{
+	return new( alloc )radMoviePlayer( );
+}
+
+//=============================================================================
+// Function:    radMovieInitialize2
+//=============================================================================
+
+void radMovieInitialize2( radMemoryAllocator alloc )
+{
+}
+
+//=============================================================================
+// Function:    radMovieTerminate2
+//=============================================================================
+
+void radMovieTerminate2( void )
+{
+}
+
+//=============================================================================
+// Function:    radMovieService2
+//=============================================================================
+
+void radMovieService2( void )
+{
+    ref< radMoviePlayer > refRadMoviePlayer = radMoviePlayer::GetLinkedClassHead( );
+
+    while( refRadMoviePlayer != NULL )
+    {
+        refRadMoviePlayer->Service( );
+
+        refRadMoviePlayer = refRadMoviePlayer->GetLinkedClassNext( );
+    }
+}
+
+#endif // ! RAD_MOVIEPLAYER_USE_BINK
