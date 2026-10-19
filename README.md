@@ -28,7 +28,7 @@ A native, modern macOS port of the classic 2003 action-adventure game ***The Sim
 
 You do **not** need to compile any code to play!
 
-1. Go to the **[Releases](https://github.com/daniiichan/The-Simpsons-Hit-and-Run-macOS/releases)** tab and download the latest `The.Simpsons.Hit.and.Run.macOS.arm64.v1.0.0.zip`.
+1. Go to the **[Releases](https://github.com/daniiichan/The-Simpsons-Hit-and-Run-macOS/releases)** tab and download the latest `The.Simpsons.Hit.and.Run.macOS.arm64.v1.1.0.zip`.
 2. Extract the ZIP file.
 3. Double-click **`Install The Simpsons Hit & Run.command`**.
 4. When the native macOS folder picker appears, select the folder containing your original **PC version** of *The Simpsons: Hit & Run* (must contain `art/`, `sound/`, `scripts/`, or `*.rcf` files).

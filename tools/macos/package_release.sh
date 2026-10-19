@@ -67,7 +67,7 @@ EOF
 codesign --force --deep --sign - "$RELEASE_DIR/payload/$APP_NAME"
 
 # Create ZIP archive
-VERSION="v1.0.0"
+VERSION="v1.1.0"
 ZIP_NAME="The.Simpsons.Hit.and.Run.macOS.arm64.$VERSION.zip"
 echo "🗜️  Creating $ZIP_NAME..."
 (cd "$RELEASE_DIR/payload" && zip -r -y -q "../$ZIP_NAME" .)
