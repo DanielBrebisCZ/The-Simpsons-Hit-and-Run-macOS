@@ -54,7 +54,7 @@ HOW TO INSTALL:
 1. Double-click "Install The Simpsons Hit & Run.command".
 2. When prompted, select your original PC installation folder of The Simpsons: Hit & Run.
    (The folder must contain the original game assets: art/, sound/, scripts/, or *.rcf).
-3. The script will copy the assets into the game app and codesign it.
+3. The script will copy the assets into ~/Library/Application Support/The Simpsons Hit and Run/.
 4. Launch the game from /Applications or directly from here!
 
 LEGAL NOTICE:
