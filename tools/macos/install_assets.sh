@@ -73,11 +73,11 @@ if [ -z "$TARGET_APP" ] || [ ! -d "$TARGET_APP" ]; then
     exit 1
 fi
 
-RESOURCES_DIR="$TARGET_APP/Contents/Resources"
-mkdir -p "$RESOURCES_DIR"
+APP_SUPPORT_DIR="$HOME/Library/Application Support/The Simpsons Hit and Run"
+mkdir -p "$APP_SUPPORT_DIR"
 
-echo "📦 Target bundle: $TARGET_APP"
-echo "⏳ Copying game assets into app bundle (this may take 10-30 seconds)..."
+echo "📂 Target destination: $APP_SUPPORT_DIR"
+echo "⏳ Installing game assets (this may take 10-30 seconds)..."
 
 # Fast APFS clone / copy
 copy_item() {
@@ -90,7 +90,7 @@ copy_item() {
 }
 
 # Copy top-level RCF archives
-find "$SRC_DIR" -maxdepth 1 -iname "*.rcf" -exec cp -f {} "$RESOURCES_DIR/" \;
+find "$SRC_DIR" -maxdepth 1 -iname "*.rcf" -exec cp -f {} "$APP_SUPPORT_DIR/" \;
 
 # Copy directories if present (case-insensitive search)
 for dir_name in "art" "scripts" "sound" "movies"; do
@@ -98,7 +98,7 @@ for dir_name in "art" "scripts" "sound" "movies"; do
     if [ -n "$FOUND_DIR" ] && [ -d "$FOUND_DIR" ]; then
         echo "  -> Copying $dir_name/..."
         # Lowercase destination directory name
-        DEST_SUBDIR="$RESOURCES_DIR/$(echo "$dir_name" | tr '[:upper:]' '[:lower:]')"
+        DEST_SUBDIR="$APP_SUPPORT_DIR/$(echo "$dir_name" | tr '[:upper:]' '[:lower:]')"
         mkdir -p "$DEST_SUBDIR"
         cp -Rc "$FOUND_DIR"/* "$DEST_SUBDIR/" 2>/dev/null || cp -R "$FOUND_DIR"/* "$DEST_SUBDIR/" 2>/dev/null || true
     fi
@@ -107,15 +107,10 @@ done
 # Copy simpsons.ini if present
 INI_FILE=$(find "$SRC_DIR" -maxdepth 1 -iname "simpsons.ini" 2>/dev/null | head -n 1)
 if [ -n "$INI_FILE" ]; then
-    cp -f "$INI_FILE" "$RESOURCES_DIR/simpsons.ini"
+    cp -f "$INI_FILE" "$APP_SUPPORT_DIR/simpsons.ini"
 fi
 
-# 5. Clean up old saves from bundle to start fresh
-rm -f "$RESOURCES_DIR"/Save* "$RESOURCES_DIR"/save* 2>/dev/null || true
-
-# 6. Re-sign the app bundle so macOS Gatekeeper accepts modified contents
-echo "🔏 Signing application bundle..."
-codesign --force --deep --sign - "$TARGET_APP"
+# Note: App bundle remains clean, untouched, and ready for Gatekeeper / Notarization!
 
 # 7. Offer to move to /Applications if not already there
 if [ "$TARGET_APP" != "/Applications/$APP_NAME" ]; then

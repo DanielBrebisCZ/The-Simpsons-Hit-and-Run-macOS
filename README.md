@@ -32,8 +32,13 @@ You do **not** need to compile any code to play!
 2. Extract the ZIP file.
 3. Double-click **`Install The Simpsons Hit & Run.command`**.
 4. When the native macOS folder picker appears, select the folder containing your original **PC version** of *The Simpsons: Hit & Run* (must contain `art/`, `sound/`, `scripts/`, or `*.rcf` files).
-5. The installer will copy and organize the assets, sign the app, and offer to place it into `/Applications`.
+5. The installer will copy and organize the assets into `~/Library/Application Support/The Simpsons Hit and Run/`, leaving the `.app` bundle clean, unmodified, and notarization-friendly.
 6. Launch and enjoy!
+
+> [!TIP]
+> **Manual Installation:**  
+> You can also copy your original PC game files directly into:  
+> `~/Library/Application Support/The Simpsons Hit and Run/`
 
 ---
 

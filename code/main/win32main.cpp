@@ -108,6 +108,68 @@ static void CrashHandler(int sig)
     _exit(1);
 }
 
+#if defined(RAD_MACOSX) || defined(__APPLE__)
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+static void SetupMacOSAssetDirectory()
+{
+    SDL_SetHint("SDL_MAC_PRESS_AND_HOLD", "0");
+
+    const char *home = getenv("HOME");
+    if (!home || home[0] == '\0') {
+        return;
+    }
+
+    // List of candidate external directories to check in ~/Library/Application Support/
+    const char *candidateSubdirs[] = {
+        "Library/Application Support/The Simpsons Hit and Run",
+        "Library/Application Support/The Simpsons Hit & Run",
+        "Library/Application Support/SimpsonsHitAndRun",
+        NULL
+    };
+
+    // Ensure the primary Application Support directory exists
+    char primaryDir[1024];
+    snprintf(primaryDir, sizeof(primaryDir), "%s/%s", home, candidateSubdirs[0]);
+    mkdir(primaryDir, 0755);
+
+    bool foundExternal = false;
+    for (int i = 0; candidateSubdirs[i] != NULL; ++i) {
+        char dirPath[1024];
+        snprintf(dirPath, sizeof(dirPath), "%s/%s", home, candidateSubdirs[i]);
+
+        // Check if this directory contains valid game data
+        const char *checkFiles[] = {
+            "scripts", "art", "sound", "movies",
+            "dialog.rcf", "scripts.rcf", "art.rcf", "sound.rcf",
+            "simpsons.ini", NULL
+        };
+
+        for (int j = 0; checkFiles[j] != NULL; ++j) {
+            char filePath[1024];
+            snprintf(filePath, sizeof(filePath), "%s/%s", dirPath, checkFiles[j]);
+            if (access(filePath, F_OK) == 0) {
+                printf("[macOS] Found game data in external directory: %s\n", dirPath);
+                if (chdir(dirPath) == 0) {
+                    foundExternal = true;
+                    break;
+                }
+            }
+        }
+        if (foundExternal) {
+            break;
+        }
+    }
+
+    if (!foundExternal) {
+        printf("[macOS] No external game assets found in ~/Library/Application Support/.\n");
+        printf("[macOS] Using bundle/current working directory, or place assets into:\n  %s\n", primaryDir);
+    }
+}
+#endif
+
 extern "C" int main( int argc, char *argv[] )
 {
     signal(SIGSEGV, CrashHandler);
@@ -135,7 +197,7 @@ extern "C" int main( int argc, char *argv[] )
 #endif
 
 #if defined(RAD_MACOSX) || defined(__APPLE__)
-    SDL_SetHint("SDL_MAC_PRESS_AND_HOLD", "0");
+    SetupMacOSAssetDirectory();
 #endif
 
 	//
